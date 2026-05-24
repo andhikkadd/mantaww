@@ -1,4 +1,4 @@
-# Mantaw — Personal News Radar
+# Mantaw - Personal News Radar
 
 **Mantaw** is a scheduled, self-hosted personal news radar designed to scan the web for high-value updates on Artificial Intelligence, Robotics, Tech Startups, and Crypto/Security. It operates as a stateless HTTP worker deployed on Google Cloud Run, periodically triggered by Google Cloud Scheduler, and delivers curated highlights directly to a Discord channel via Webhook.
 
