@@ -1,11 +1,13 @@
 import asyncio
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import logging
 import re
+import time
 from typing import Dict, Any, List, Optional
 import httpx
 import feedparser
 from fastapi import FastAPI, HTTPException, Query, status
-from fastapi.responses import JSONResponse
 
 from config import get_settings
 
@@ -37,9 +39,12 @@ ALLOWLIST = [
     "startup", "llm", "cloud run", "google cloud", "model release", "ai model"
 ]
 
+# Combined Blocklist (including new v0.2 keywords)
 BLOCKLIST = [
     "sponsored", "giveaway", "coupon", "price prediction",
-    "promo", "discount", "casino", "betting"
+    "promo", "discount", "casino", "betting",
+    "wordpress plugin", "top 10", "top 7", "best wordpress",
+    "nft", "non-fungible token", "review 2022", "review 2023"
 ]
 
 IMPORTANT_WORDS = [
@@ -55,6 +60,93 @@ AI_ROBOT_WORDS = ["nvidia", "gpu", "robot", "robotics", "humanoid"]
 AI_WORDS = ["openai", "anthropic", "deepmind", "model", "agent", "llm"]
 
 
+# ==========================================
+# Helper Functions (Recency & Freshness)
+# ==========================================
+
+def parse_published_date(item: Dict[str, Any]) -> Optional[datetime]:
+    """Parses published_parsed or updated_parsed into a timezone-aware UTC datetime.
+
+    Falls back to parsing the raw published string using RFC 2822 standard.
+    """
+    struct_time = item.get("published_parsed") or item.get("updated_parsed")
+    if struct_time:
+        try:
+            # struct_time contains: tm_year, tm_mon, tm_mday, tm_hour, tm_min, tm_sec
+            dt = datetime(*struct_time[:6], tzinfo=timezone.utc)
+            return dt
+        except Exception as e:
+            logger.debug(f"Failed to convert struct_time to datetime: {e}")
+
+    raw_pub = item.get("published") or item.get("updated")
+    if raw_pub:
+        try:
+            dt = parsedate_to_datetime(raw_pub)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception as e:
+            logger.debug(f"Failed to parse published date string '{raw_pub}': {e}")
+
+    return None
+
+
+def check_item_age(dt: Optional[datetime], max_age_days: int) -> bool:
+    """Checks if the item is older than max_age_days.
+
+    Returns True if the item age is within limits, and False if it exceeds max_age_days.
+    If the date is missing or unparseable (dt is None), returns True (should not be discarded).
+    """
+    if dt is None:
+        return True
+
+    now = datetime.now(timezone.utc)
+    age_seconds = (now - dt).total_seconds()
+    return age_seconds <= (max_age_days * 86400)
+
+
+def calculate_freshness_bonus(dt: Optional[datetime]) -> int:
+    """Calculates freshness score bonus: +2 if <24 hours, +1 if <3 days (72 hours).
+
+    Returns 0 if the date is missing, older, or unparseable.
+    """
+    if dt is None:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    age_seconds = (now - dt).total_seconds()
+
+    if age_seconds < 86400:  # Within 24 hours
+        return 2
+    elif age_seconds < 259200:  # Within 3 days (72 hours)
+        return 1
+
+    return 0
+
+
+def apply_source_caps(items: List[Dict[str, Any]], max_items: int, max_per_source: int) -> List[Dict[str, Any]]:
+    """Applies a capping limit for how many items from the same source can be alerted."""
+    selected = []
+    source_counts = {}
+
+    for item in items:
+        if len(selected) >= max_items:
+            break
+
+        source = item["source"]
+        current_count = source_counts.get(source, 0)
+
+        if current_count < max_per_source:
+            selected.append(item)
+            source_counts[source] = current_count + 1
+
+    return selected
+
+
+# ==========================================
+# Core Processing & Formatting Functions
+# ==========================================
+
 def clean_html(text: str) -> str:
     """Removes HTML tags and normalizes whitespace."""
     if not text:
@@ -63,7 +155,7 @@ def clean_html(text: str) -> str:
     return " ".join(clean.split())
 
 
-def process_feed_item(item: Dict[str, Any], source_name: str) -> Optional[Dict[str, Any]]:
+def process_feed_item(item: Dict[str, Any], source_name: str, dt: Optional[datetime]) -> Optional[Dict[str, Any]]:
     """Filters, scores, and categorizes a single RSS feed item."""
     title = item.get("title", "")
     summary = item.get("summary", "") or item.get("description", "") or ""
@@ -100,6 +192,16 @@ def process_feed_item(item: Dict[str, Any], source_name: str) -> Optional[Dict[s
             score += 2
             break
 
+    # Freshness / Recency checks
+    unparseable_date = False
+    if dt is not None:
+        freshness_bonus = calculate_freshness_bonus(dt)
+        score += freshness_bonus
+    else:
+        # Penalty for missing or unparseable date
+        score -= 2
+        unparseable_date = True
+
     # 3. Category Classification
     if any(word in combined_text_lower for word in CRYPTO_WORDS):
         category = "Crypto/Security"
@@ -118,7 +220,8 @@ def process_feed_item(item: Dict[str, Any], source_name: str) -> Optional[Dict[s
         "score": score,
         "matched_keywords": matched_keywords,
         "category": category,
-        "source": source_name
+        "source": source_name,
+        "unparseable_date": unparseable_date
     }
 
 
@@ -158,6 +261,10 @@ def format_discord_embed(item: Dict[str, Any]) -> Dict[str, Any]:
 
     keywords_str = ", ".join(item["matched_keywords"]) if item["matched_keywords"] else "None"
 
+    published_display = item["published"]
+    if item.get("unparseable_date"):
+        published_display += " (Unparseable/Missing Date)"
+
     return {
         "title": f"{emoji} [{item['category']}] {title}",
         "url": item["link"],
@@ -166,7 +273,7 @@ def format_discord_embed(item: Dict[str, Any]) -> Dict[str, Any]:
         "fields": [
             {"name": "Score", "value": str(item["score"]), "inline": True},
             {"name": "Matched Keywords", "value": f"`{keywords_str}`", "inline": True},
-            {"name": "Published Date", "value": item["published"], "inline": False}
+            {"name": "Published Date", "value": published_display, "inline": False}
         ],
         "footer": {
             "text": f"Source: {item['source']}"
@@ -236,14 +343,34 @@ async def run(secret: Optional[str] = Query(None)):
         tasks = [fetch_and_parse_feed(client, name, url) for name, url in FEEDS.items()]
         feeds_entries = await asyncio.gather(*tasks)
 
-    # Combine results
+    # Combine and process results
+    raw_processed_count = 0
+    blocked_count = 0
+    outdated_count = 0
+    unparseable_date_count = 0
+    filtered_count = 0
+    
     all_processed_items = []
     seen_links = set()
 
     for (name, url), entries in zip(FEEDS.items(), feeds_entries):
         for entry in entries:
-            processed = process_feed_item(entry, name)
+            raw_processed_count += 1
+            
+            # Age Filter: Check date freshness
+            dt = parse_published_date(entry)
+            
+            if dt is None:
+                unparseable_date_count += 1
+            
+            # Outdated check
+            if dt is not None and not check_item_age(dt, settings.max_item_age_days):
+                outdated_count += 1
+                continue
+
+            processed = process_feed_item(entry, name, dt)
             if not processed:
+                blocked_count += 1
                 continue
 
             # Check threshold and deduplicate
@@ -252,30 +379,48 @@ async def run(secret: Optional[str] = Query(None)):
                 if link not in seen_links:
                     seen_links.add(link)
                     all_processed_items.append(processed)
+            else:
+                filtered_count += 1
 
     # Sort descending by score
     all_processed_items.sort(key=lambda x: x["score"], reverse=True)
 
-    # Limit to MAX_ITEMS
-    selected_items = all_processed_items[:settings.max_items]
+    # Apply Source Capping and Max limit limits
+    selected_items = apply_source_caps(
+        all_processed_items,
+        settings.max_items,
+        settings.max_items_per_source
+    )
 
-    logger.info(f"Found {len(all_processed_items)} items exceeding threshold score of {settings.min_score}. "
-                f"Selecting top {len(selected_items)} after deduplication and sorting.")
+    logger.info(
+        f"Pipeline Summary - Processed: {raw_processed_count}, Blocked: {blocked_count}, "
+        f"Outdated: {outdated_count}, Unparseable: {unparseable_date_count}, "
+        f"Filtered (Low Score): {filtered_count}, Qualified: {len(all_processed_items)}, "
+        f"Alerted: {len(selected_items)}"
+    )
 
     # Send notifications
     await send_to_discord(settings.discord_webhook_url, selected_items)
 
     return {
         "status": "success",
-        "processed_count": len(all_processed_items),
+        "processed_count": raw_processed_count,
+        "filtered_count": filtered_count,
+        "blocked_count": blocked_count,
+        "outdated_count": outdated_count,
+        "unparseable_date_count": unparseable_date_count,
         "alerted_count": len(selected_items),
+        "max_item_age_days": settings.max_item_age_days,
+        "max_items_per_source": settings.max_items_per_source,
         "items": [
             {
                 "title": item["title"],
                 "score": item["score"],
                 "category": item["category"],
                 "source": item["source"],
-                "link": item["link"]
+                "published": item["published"],
+                "link": item["link"],
+                "matched_keywords": item["matched_keywords"]
             }
             for item in selected_items
         ]

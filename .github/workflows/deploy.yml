@@ -35,3 +35,5 @@ jobs:
             RUN_SECRET=${{ secrets.RUN_SECRET }}
             MIN_SCORE=4
             MAX_ITEMS=10
+            MAX_ITEM_AGE_DAYS=14
+            MAX_ITEMS_PER_SOURCE=3

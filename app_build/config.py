@@ -7,6 +7,8 @@ class Settings(BaseSettings):
     min_score: int = Field(4, validation_alias="MIN_SCORE")
     max_items: int = Field(10, validation_alias="MAX_ITEMS")
     run_secret: Optional[str] = Field(None, validation_alias="RUN_SECRET")
+    max_item_age_days: int = Field(14, validation_alias="MAX_ITEM_AGE_DAYS")
+    max_items_per_source: int = Field(3, validation_alias="MAX_ITEMS_PER_SOURCE")
 
     model_config = SettingsConfigDict(
         env_file=".env",
